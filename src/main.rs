@@ -1,4 +1,11 @@
+extern crate rodio;
 extern crate sdl2;
+
+use rodio::{
+    Decoder,
+    Sink,
+    source::{Source, Zero},
+};
 
 use sdl2::{
     event::Event,
@@ -7,11 +14,84 @@ use sdl2::{
 };
 
 use std::{
+    fs::File,
+    io::{BufReader, Read, Seek},
     time::{Duration, Instant},
 };
 
 
+struct TrackingSource<R>
+where
+    R: Read + Seek
+{
+    inner: Decoder<R>,
+    samples_read: u32,
+    time_base: Instant,
+}
+
+impl<R> TrackingSource<R>
+where 
+    R: Read + Seek
+{
+    fn new(inner: Decoder<R>) -> TrackingSource<R> {
+        TrackingSource {
+            inner: inner,
+            samples_read: 0,
+            time_base: Instant::now(),
+        }
+    }
+}
+
+impl<R> Iterator for TrackingSource<R>
+where 
+    R: Read + Seek
+{
+    type Item = i16;
+
+    fn next(&mut self) -> Option<i16> {
+        self.samples_read += 1;
+        if self.samples_read % self.inner.sample_rate() == 0 {
+            let millis = (self.samples_read as u64 * 1000) / (self.inner.sample_rate() as u64 * self.inner.channels() as u64);
+            println!("{:?} {:?}", millis, self.time_base.elapsed());
+        }
+        self.inner.next()
+    }
+}
+
+impl<R> Source for TrackingSource<R>
+where
+    R: Read + Seek
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+}
+
 fn main() {
+    let device  = rodio::default_output_device().expect("Couldn't get default audio device");
+    let mut sink = Sink::new(&device);
+
+
+    let file = File::open("top.ogg").expect("Couldn't open file");
+    let source = TrackingSource::new(Decoder::new(BufReader::new(file)).expect("Couldn't decode file"));
+    let silence_source = Zero::<i16>::new(source.channels(), source.sample_rate()).take_duration(Duration::new(0, 10));
+
+    sink.set_volume(0.05);
+    sink.append(silence_source);
+    sink.append(source);
+
     let sdl = sdl2::init().unwrap();
     let video_subsystem = sdl.video().unwrap();
 
@@ -55,7 +135,7 @@ fn main() {
                 ((count_duration.as_secs() as f64) + (count_duration.subsec_millis() as f64) / 1000.0);
             frame_count_start = Instant::now();
             frame_count = 0;
-            println!("FPS: {}", fps);
+//            println!("FPS: {}", fps);
         }
 
         let bpm = 160;
