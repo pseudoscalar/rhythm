@@ -7,3 +7,6 @@ edition = "2018"
 [dependencies]
 rodio = "0.8.1"
 sdl2 = "0.32.1"
+
+[replace]
+"rodio:0.8.1" = { path = '../rodio' }
