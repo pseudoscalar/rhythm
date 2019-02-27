@@ -1,8 +1,6 @@
-extern crate rodio;
-extern crate sdl2;
-
 use rodio::{
     Decoder,
+    Device,
     Sink,
     source::{Source, Zero},
 };
@@ -11,20 +9,27 @@ use sdl2::{
     event::Event,
     keyboard::Keycode,
     pixels::Color,
+    render::Canvas,
+    video::Window,
+    EventPump,
+    Sdl,
 };
+
+use specs::prelude::*;
 
 use std::{
     fs::File,
-    io::{BufReader, Read, Seek},
+    io::{BufReader, Seek},
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     time::{Duration, Instant},
+    vec::Vec,
 };
 
 
 struct TrackingSource<R>
 where
-    R: Read + Seek
+    R: std::io::Read + Seek
 {
     inner: Decoder<R>,
     samples_read: Arc<AtomicUsize>,
@@ -33,7 +38,7 @@ where
 
 impl<R> TrackingSource<R>
 where 
-    R: Read + Seek
+    R: std::io::Read + Seek
 {
     fn new(inner: Decoder<R>) -> TrackingSource<R> {
         TrackingSource {
@@ -46,7 +51,7 @@ where
 
 impl<R> Iterator for TrackingSource<R>
 where 
-    R: Read + Seek
+    R: std::io::Read + Seek
 {
     type Item = i16;
 
@@ -58,7 +63,7 @@ where
 
 impl<R> Source for TrackingSource<R>
 where
-    R: Read + Seek
+    R: std::io::Read + Seek
 {
     fn current_frame_len(&self) -> Option<usize> {
         self.inner.current_frame_len()
@@ -77,7 +82,88 @@ where
     }
 }
 
+struct ClearColor(Color);
+
+impl Default for ClearColor {
+    fn default() -> ClearColor { ClearColor(Color::RGB(0,0,0)) }
+}
+
+struct InputEvent {
+    timestamp: u32,
+    keycode: Option<Keycode>,
+}
+
+#[derive(Default)]
+struct InputEvents(Vec<InputEvent>);
+
+#[derive(Default)]
+struct IsRunning(bool);
+
+struct SdlSystem {
+    sdl: Sdl,
+    canvas: Canvas<Window>,
+    event_pump: EventPump,
+}
+
+impl<'a> System<'a> for SdlSystem {
+    type SystemData = (Write<'a, InputEvents>,
+                       Read<'a, ClearColor>);
+
+    fn run(&mut self, data: Self::SystemData) {
+        let (mut input_events, clear_color) = data;
+
+        input_events.0.append(&mut self.event_pump.poll_iter().filter_map(|e| {
+            match e {
+                Event::KeyDown { keycode, timestamp, .. } => Some(InputEvent { keycode, timestamp }),
+                _ => None,
+            }
+        }).collect::<Vec<InputEvent>>());
+
+        self.canvas.set_draw_color(clear_color.0);
+        self.canvas.clear();
+        self.canvas.present();
+    }
+}
+
+struct OmniSystem;
+
+impl<'a> System<'a> for OmniSystem {
+    type SystemData = (Write<'a, IsRunning>,
+                       Write<'a, InputEvents>,
+                       Write<'a, ClearColor>,
+                       Option<Read<'a, Device>>,
+                       Option<Read<'a, Sink>>);
+
+    fn run(&mut self, data: Self::SystemData) {
+        let (mut isRunning, mut input_events, mut clear_color, maybe_device, maybe_sink) = data;
+
+        if let (Some(device), Some(sink)) = (maybe_device, maybe_sink) {
+            let format = device.default_output_format().expect("Couldn't get default output format");
+            let samples_per_sec = format.channels as u32 * format.sample_rate.0;
+
+            let samples = sink.samples_written.load(Ordering::Relaxed);
+            let sample_time = samples as f64 / samples_per_sec as f64;
+            let beat_time = sample_time * 160.0 / 60.0;
+
+            let color = ((1.0 - beat_time.fract()).powi(2) * 255.0) as u8;
+            clear_color.0 = Color::RGB(color, 0, color);
+        }
+
+        for event in input_events.0.drain(..) {
+            match event {
+                InputEvent { keycode: Some(Keycode::Escape), .. } => {
+                    isRunning.0 = false;
+                },
+                _ => {},
+            }
+        }
+    }
+}
+
 fn main() {
+    let mut world = World::new();
+
+
     let device  = rodio::default_output_device().expect("Couldn't get default audio device");
     let format = device.default_output_format().expect("Couldn't get default output format");
     let samples_per_sec = format.channels as u32 * format.sample_rate.0;
@@ -104,59 +190,35 @@ fn main() {
         .build()
         .unwrap();
 
+    let clear_color = Color::RGB(255, 0, 255);
     let mut canvas = window.into_canvas()
-        .present_vsync()
         .build()
         .unwrap();
-    canvas.set_draw_color(Color::RGB(255, 0, 255));
+    canvas.set_draw_color(clear_color);
     canvas.clear();
     canvas.present();
 
     let mut event_pump = sdl.event_pump().unwrap();
 
-    let mut frame_count_start = loop_start;
-    let mut frame_count = 0;
-    let one_second = Duration::new(1, 0);
+    world.add_resource(IsRunning(true));
+    world.add_resource(ClearColor(clear_color));
+    world.add_resource(sink);
+    world.add_resource(device);
+    world.add_resource(InputEvents(Vec::new()));
+
+    let sdl_system = SdlSystem { sdl, canvas, event_pump };
+
+    let mut dispatcher = DispatcherBuilder::new()
+        .with_thread_local(sdl_system)
+        .with(OmniSystem, "omni_system", &[])
+        .build();
+
     'main: loop {
-        for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. } |
-                Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
-                    break 'main;
-                },
-                Event::KeyDown { keycode: Some(keycode), .. } => {
-                    let samples = sink.samples_written.load(Ordering::Relaxed);
-                    let sample_time = samples as f64 / samples_per_sec as f64;
-
-                    let source_samples = samples_read.load(Ordering::Relaxed);
-                    let source_sample_time = source_samples as f64 / source_samples_per_sec as f64;
-
-                    let dur = loop_start.elapsed();
-                    let clock_time = dur.as_secs() as f64 + (dur.subsec_millis() as f64 / 1000.0);
-                    println!("{:?} {:?} {:?}", sample_time, sample_time - source_sample_time, keycode);
-                },
-                _ => {}
-            }
+        dispatcher.dispatch(&mut world.res);
+        world.maintain();
+        if !world.read_resource::<IsRunning>().0 {
+            break 'main;
         }
-
-        frame_count += 1;
-        if frame_count_start.elapsed() > one_second {
-            let count_duration = frame_count_start.elapsed();
-            let fps = (frame_count as f64) / 
-                ((count_duration.as_secs() as f64) + (count_duration.subsec_millis() as f64) / 1000.0);
-            frame_count_start = Instant::now();
-            frame_count = 0;
-//            println!("FPS: {}", fps);
-        }
-
-        let bpm = 160;
-        let beat_param = ((loop_start.elapsed() * bpm / 60).subsec_millis() as f64) / 1000.0;
-        let color = ((1.0 - beat_param).powi(2) * 255.0) as u8;
-
-        canvas.set_draw_color(Color::RGB(color, 0, color));
-        canvas.clear();
-        canvas.present();
     }
-
     println!("Hello, world!");
 }
