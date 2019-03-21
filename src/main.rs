@@ -90,6 +90,7 @@ impl Default for ClearColor {
     fn default() -> ClearColor { ClearColor(Color::RGB(0,0,0)) }
 }
 
+#[derive(Debug)]
 struct InputEvent {
     timestamp: u32,
     keycode: Option<Keycode>,
@@ -136,15 +137,18 @@ impl<'a> System<'a> for SdlSystem {
 struct OmniSystem;
 
 impl<'a> System<'a> for OmniSystem {
-    type SystemData = (Write<'a, IsRunning>,
+    type SystemData = (Entities<'a>,
+                       Write<'a, IsRunning>,
                        Write<'a, InputEvents>,
                        Write<'a, ClearColor>,
                        Write<'a, AudioTime>,
                        Option<Read<'a, Device>>,
-                       Option<Read<'a, Sink>>);
+                       Option<Read<'a, Sink>>,
+                       ReadStorage<'a, TargetInput>,
+                       ReadStorage<'a, TargetTime>);
 
     fn run(&mut self, data: Self::SystemData) {
-        let (mut isRunning, mut input_events, mut clear_color, mut audio_time, maybe_device, maybe_sink) = data;
+        let (entities, mut isRunning, mut input_events, mut clear_color, mut audio_time, maybe_device, maybe_sink, target_input_storage, target_time_storage) = data;
 
         if let (Some(device), Some(sink)) = (maybe_device, maybe_sink) {
             let format = device.default_output_format().expect("Couldn't get default output format");
@@ -154,8 +158,9 @@ impl<'a> System<'a> for OmniSystem {
             let sample_time = samples as f64 / samples_per_sec as f64;
             let beat_time = sample_time * 160.0 / 60.0;
 
-            let color = ((1.0 - beat_time.fract()).powi(2) * 255.0) as u8;
-            clear_color.0 = Color::RGB(color, 0, color);
+            let color = ((1.0 - beat_time.fract()).powi(2) * 128.0) as u8;
+            let color = 255 - color;
+            clear_color.0 = Color::RGB(color, color, color);
 
             audio_time.0 = (sample_time * 1000.0) as u64;
         }
@@ -164,6 +169,23 @@ impl<'a> System<'a> for OmniSystem {
             match event {
                 InputEvent { keycode: Some(Keycode::Escape), .. } => {
                     isRunning.0 = false;
+                },
+                InputEvent { keycode: Some(Keycode::Backquote), timestamp } => {
+                    if audio_time.0 > timestamp as u64 {
+                        dbg!(audio_time.0 - timestamp as u64);
+                    } else {
+                        dbg!(("-", timestamp as u64 - audio_time.0));
+                    }
+                },
+                InputEvent { keycode: Some(keycode), timestamp } => {
+                    if let Some((_, target_time)) = (&target_input_storage, &target_time_storage).join().filter(|(input, time)| input.0 == keycode && time.0 < audio_time.0 + 80).max_by_key(|(_, time)| time.0) {
+                        let timestamp = timestamp as u64 + 45;
+                        if timestamp > target_time.0 {
+                            dbg!(timestamp - target_time.0);
+                        } else {
+                            dbg!(target_time.0 - timestamp );
+                        }
+                    }
                 },
                 _ => {},
             }
@@ -205,7 +227,7 @@ impl<'a> System<'a> for TimeScrollingSystem {
 
         for (target_time, pos) in (&target_time_storage, &mut position_storage).join() {
             let time_delta = target_time.0 as i64 - audio_time.0 as i64;
-            let displacement = time_delta as f64 * 0.5;
+            let displacement = time_delta as f64 * 0.8;
 
             pos.y = 200.0 + displacement;
         }
@@ -218,34 +240,53 @@ impl<'a> System<'a> for QuaverGeneratorSystem {
     type SystemData = (Entities<'a>,
                     Read<'a, AudioTime>,
                     WriteStorage<'a, TargetTime>,
+                    WriteStorage<'a, TargetInput>,
                     WriteStorage<'a, Rectangle>,
                     WriteStorage<'a, Position>);
 
     fn run(&mut self, data: Self::SystemData) {
-        let (entities, audio_time, mut target_time_storage, mut rect_storage, mut position_storage) = data;
+        let (entities, audio_time, mut target_time_storage, mut target_input_storage, mut rect_storage, mut position_storage) = data;
 
-        if let Some(max_time) = target_time_storage.join().max_by_key(|time| time.0) {
-            let mut max_quaver = (max_time.0 * 160 * 2) / 60_000;
-            let remainder = (max_time.0 * 160 * 2) % 60_000;
-            if remainder < 100 {
-                max_quaver += 1;
-            }
-            let next_time = ((max_quaver + 1) * 60_000) / (160 * 2);
+        let max_time = target_time_storage.join().max_by_key(|time| time.0).cloned().unwrap_or(TargetTime(audio_time.0));
+        let adj_max_time = max_time.0 - 110;
+        let mut max_quaver = (adj_max_time * 160 * 2) / 60_000;
+        let remainder = (adj_max_time * 160 * 2) % 60_000;
+        if remainder > 30_000 {
+            max_quaver += 1;
+        }
+        let quaver_index = max_quaver + 1;
+        let next_time = (quaver_index * 60_000) / (160 * 2) + 110;
 
-            if next_time - audio_time.0 < 1000 {
-                let next_note = entities.create();
-                
-                target_time_storage.insert(next_note, TargetTime(next_time));
-                rect_storage.insert(next_note, Rectangle{ width: 100.0, height: 40.0 });
-                position_storage.insert(next_note, Position{ x: 430.0, y: 0.0});
+        if next_time > audio_time.0 && next_time - audio_time.0 < 1000 {
+            let next_note = entities.create();
+            let (x_offset, input) = if quaver_index % 2 == 0 {
+                (-40.0, TargetInput(Keycode::Left))
             }
-        } 
-        else {
-            let first_note = entities.create();
-            target_time_storage.insert(first_note, TargetTime(0));
-            rect_storage.insert(first_note, Rectangle{ width: 100.0, height: 100.0 });
-            position_storage.insert(first_note, Position{ x: 430.0, y: 0.0});
-        } 
+            else {
+                (40.0, TargetInput(Keycode::Right))
+            };
+            
+            target_time_storage.insert(next_note, TargetTime(next_time));
+            rect_storage.insert(next_note, Rectangle{ width: 100.0, height: 40.0 });
+            position_storage.insert(next_note, Position{ x: 430.0 + x_offset, y: 0.0});
+            target_input_storage.insert(next_note, input);
+        }
+    }
+}
+
+struct TimedItemReaper;
+
+impl<'a> System<'a> for TimedItemReaper {
+    type SystemData = (Entities<'a>,
+                       Read<'a, AudioTime>,
+                       ReadStorage<'a, TargetTime>);
+
+    fn run(&mut self, data: Self::SystemData) {
+        let (entities, audio_time, target_time_storage) = data;
+
+        for (entity, _) in (&*entities, &target_time_storage).join().filter(|(_, time)| time.0 + 1000 < audio_time.0) {
+            entities.delete(entity);
+        }
     }
 }
 
@@ -280,6 +321,15 @@ impl Component for TargetTime {
     type Storage = VecStorage<Self>;
 }
 
+#[derive(Debug)]
+#[derive(Clone)]
+#[derive(Copy)]
+struct TargetInput(Keycode);
+
+impl Component for TargetInput {
+    type Storage = VecStorage<Self>;
+}
+
 fn main() {
     let mut world = World::new();
 
@@ -310,7 +360,7 @@ fn main() {
         .build()
         .unwrap();
 
-    let clear_color = Color::RGB(255, 0, 255);
+    let clear_color = Color::RGB(255, 255, 255);
     let mut canvas = window.into_canvas()
         .build()
         .unwrap();
@@ -331,17 +381,13 @@ fn main() {
     world.register::<Position>();
     world.register::<Rectangle>();
     world.register::<TargetTime>();
+    world.register::<TargetInput>();
 
-    let square = Rectangle { width: 100.1, height: 100.1 };
-    world.create_entity().with(square).with(Position { x:30.1, y: 200.1 }).build();
-    world.create_entity().with(square).with(Position { x:230.1, y: 200.1 }).build();
-
-    /*world.create_entity()
-        .with(square)
-        .with(Position { x:430.1, y: 200.1 })
-        .with(TargetTime(12_000))
+    world.create_entity()
+        .with(Rectangle { width: 3000.0, height: 1.0 })
+        .with(Position { x: 0.0, y: 200.0 })
         .build();
-    */
+    
 
     let sdl_system = SdlSystem { sdl, canvas, event_pump };
 
@@ -351,6 +397,7 @@ fn main() {
         .with(RenderingSystem, "rendering_system", &[])
         .with(TimeScrollingSystem, "time_scrolling_system", &[])
         .with(QuaverGeneratorSystem, "quaver_generator_system", &[])
+        .with(TimedItemReaper, "timed_item_reaper", &[])
         .build();
 
     'main: loop {
