@@ -8,7 +8,7 @@ use rodio::{
 use sdl2::{
     event::Event,
     keyboard::Keycode,
-    pixels::Color,
+    pixels::Color as SdlColor,
     render::Canvas,
     video::Window,
     EventPump,
@@ -83,11 +83,20 @@ where
 }
 
 #[derive(Default)]
-struct SdlRects(Vec<sdl2::rect::Rect>);
+struct DebugFlag(bool);
+
+#[derive(Default)]
+struct AudioContext {
+    milli_bpm: u64,
+    first_beat_offset: u64,
+}
+
+#[derive(Default)]
+struct SdlRects(Vec<(SdlColor, sdl2::rect::Rect)>);
 struct ClearColor(Color);
 
 impl Default for ClearColor {
-    fn default() -> ClearColor { ClearColor(Color::RGB(0,0,0)) }
+    fn default() -> ClearColor { ClearColor(Color::rgb(0,0,0)) }
 }
 
 #[derive(Debug)]
@@ -128,8 +137,10 @@ impl<'a> System<'a> for SdlSystem {
 
         self.canvas.set_draw_color(clear_color.0);
         self.canvas.clear();
-        self.canvas.set_draw_color(Color::RGB(0,0,0));
-        self.canvas.fill_rects(&(sdl_rects.0)[..]);
+        for (color, rect) in sdl_rects.0.iter() {
+            self.canvas.set_draw_color(color.clone());
+            self.canvas.fill_rect(Some(rect.clone()));
+        }
         self.canvas.present();
     }
 }
@@ -142,35 +153,41 @@ impl<'a> System<'a> for OmniSystem {
                        Write<'a, InputEvents>,
                        Write<'a, ClearColor>,
                        Write<'a, AudioTime>,
+                       Write<'a, DebugFlag>,
+                       Read<'a, AudioContext>,
                        Option<Read<'a, Device>>,
                        Option<Read<'a, Sink>>,
                        ReadStorage<'a, TargetInput>,
-                       ReadStorage<'a, TargetTime>);
+                       ReadStorage<'a, TargetTime>, 
+                       WriteStorage<'a, Color>);
 
     fn run(&mut self, data: Self::SystemData) {
-        let (entities, mut isRunning, mut input_events, mut clear_color, mut audio_time, maybe_device, maybe_sink, target_input_storage, target_time_storage) = data;
+        let (entities, mut isRunning, mut input_events, mut clear_color, mut audio_time, mut debug_flag, audio_context, maybe_device, maybe_sink, target_input_storage, target_time_storage, mut color_storage) = data;
 
         if let (Some(device), Some(sink)) = (maybe_device, maybe_sink) {
             let format = device.default_output_format().expect("Couldn't get default output format");
             let samples_per_sec = format.channels as u32 * format.sample_rate.0;
 
             let samples = sink.samples_written.load(Ordering::Relaxed);
-            let sample_time = samples as f64 / samples_per_sec as f64;
-            let beat_time = sample_time * 160.0 / 60.0;
+            let sample_time = samples as f64 / samples_per_sec as f64 - audio_context.first_beat_offset as f64 / 1000.0;
+            let beat_time = sample_time * (audio_context.milli_bpm / 1000) as f64 / 60.0;
 
             let color = ((1.0 - beat_time.fract()).powi(2) * 128.0) as u8;
             let color = 255 - color;
-            clear_color.0 = Color::RGB(color, color, color);
+            clear_color.0 = Color::rgb(color, color, color);
 
             audio_time.0 = (sample_time * 1000.0) as u64;
         }
 
+        debug_flag.0 = false;
         for event in input_events.0.drain(..) {
             match event {
                 InputEvent { keycode: Some(Keycode::Escape), .. } => {
                     isRunning.0 = false;
                 },
                 InputEvent { keycode: Some(Keycode::Backquote), timestamp } => {
+                    debug_flag.0 = true;
+
                     if audio_time.0 > timestamp as u64 {
                         dbg!(audio_time.0 - timestamp as u64);
                     } else {
@@ -178,13 +195,26 @@ impl<'a> System<'a> for OmniSystem {
                     }
                 },
                 InputEvent { keycode: Some(keycode), timestamp } => {
-                    if let Some((_, target_time)) = (&target_input_storage, &target_time_storage).join().filter(|(input, time)| input.0 == keycode && time.0 < audio_time.0 + 80).max_by_key(|(_, time)| time.0) {
+                    if let Some((entity, _, target_time)) = (&*entities, &target_input_storage, &target_time_storage).join().filter(|(_, input, time)| input.0 == keycode && time.0 < audio_time.0 + 150).max_by_key(|(_, _, time)| time.0) {
                         let timestamp = timestamp as u64 + 45;
-                        if timestamp > target_time.0 {
-                            dbg!(timestamp - target_time.0);
+                        let error = if timestamp > target_time.0 {
+                            dbg!(timestamp - target_time.0)
                         } else {
-                            dbg!(target_time.0 - timestamp );
+                            dbg!(target_time.0 - timestamp)
+                        };
+                        
+                        if let Some(color) = color_storage.get_mut(entity) {
+                            *color = if error <= 45 {
+                                Color::rgb(255, 255, 0)
+                            } else if error <= 90 {
+                                Color::rgb(255, 128, 128)
+                            } else if error <= 135 {
+                                Color::rgb(255, 0, 255)
+                            } else {
+                                Color::rgb(255, 0, 0)
+                            }
                         }
+
                     }
                 },
                 _ => {},
@@ -198,18 +228,22 @@ struct RenderingSystem;
 impl<'a> System<'a> for RenderingSystem {
     type SystemData = (ReadStorage<'a, Rectangle>,
                        ReadStorage<'a, Position>,
+                       ReadStorage<'a, Color>,
                        Write<'a, SdlRects>);
 
     fn run(&mut self, data: Self::SystemData) {
-        let (rect_storage, position_storage, mut sdl_rects) = data;
+        let (rect_storage, position_storage, color_storage, mut sdl_rects) = data;
 
         sdl_rects.0.clear();
 
-        for (rect, pos) in (&rect_storage, &position_storage).join() {
-            sdl_rects.0.push(sdl2::rect::Rect::from_center(
-                (pos.x.round() as i32, pos.y.round() as i32),
-                rect.width.round() as u32,
-                rect.height.round() as u32,
+        for (rect, pos, color) in (&rect_storage, &position_storage, &color_storage).join() {
+            sdl_rects.0.push((
+                    color.clone().into(),
+                    sdl2::rect::Rect::from_center(
+                        (pos.x.round() as i32, pos.y.round() as i32),
+                        rect.width.round() as u32,
+                        rect.height.round() as u32,
+                    )
             ));
         }
     }
@@ -239,23 +273,29 @@ struct QuaverGeneratorSystem;
 impl<'a> System<'a> for QuaverGeneratorSystem {
     type SystemData = (Entities<'a>,
                     Read<'a, AudioTime>,
+                    Read<'a, DebugFlag>,
+                    Read<'a, AudioContext>,
                     WriteStorage<'a, TargetTime>,
                     WriteStorage<'a, TargetInput>,
                     WriteStorage<'a, Rectangle>,
+                    WriteStorage<'a, Color>,
                     WriteStorage<'a, Position>);
 
     fn run(&mut self, data: Self::SystemData) {
-        let (entities, audio_time, mut target_time_storage, mut target_input_storage, mut rect_storage, mut position_storage) = data;
+        let (entities, audio_time, debug_flag, audio_context, mut target_time_storage, mut target_input_storage, mut rect_storage, mut color_storage, mut position_storage) = data;
 
         let max_time = target_time_storage.join().max_by_key(|time| time.0).cloned().unwrap_or(TargetTime(audio_time.0));
-        let adj_max_time = max_time.0 - 110;
-        let mut max_quaver = (adj_max_time * 160 * 2) / 60_000;
-        let remainder = (adj_max_time * 160 * 2) % 60_000;
+        if debug_flag.0 {
+            dbg!(max_time);
+        }
+        let adj_max_time = max_time.0.saturating_sub(audio_context.first_beat_offset);
+        let mut max_quaver = (adj_max_time * audio_context.milli_bpm * 2) / 60_000_000;
+        let remainder = (adj_max_time * audio_context.milli_bpm * 2) % 60_000_000;
         if remainder > 30_000 {
             max_quaver += 1;
         }
         let quaver_index = max_quaver + 1;
-        let next_time = (quaver_index * 60_000) / (160 * 2) + 110;
+        let next_time = (quaver_index * 60_000_000) / (audio_context.milli_bpm * 2) + audio_context.first_beat_offset;
 
         if next_time > audio_time.0 && next_time - audio_time.0 < 1000 {
             let next_note = entities.create();
@@ -270,6 +310,7 @@ impl<'a> System<'a> for QuaverGeneratorSystem {
             rect_storage.insert(next_note, Rectangle{ width: 100.0, height: 40.0 });
             position_storage.insert(next_note, Position{ x: 430.0 + x_offset, y: 0.0});
             target_input_storage.insert(next_note, input);
+            color_storage.insert(next_note, Color::rgb(0,0,0));
         }
     }
 }
@@ -324,6 +365,31 @@ impl Component for TargetTime {
 #[derive(Debug)]
 #[derive(Clone)]
 #[derive(Copy)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl Color {
+    fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Color {r, g, b}
+    }
+}
+
+impl Component for Color {
+    type Storage = VecStorage<Self>;
+}
+
+impl Into<SdlColor> for Color {
+    fn into(self) -> SdlColor {
+        SdlColor::RGB(self.r, self.g, self.b)
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
+#[derive(Copy)]
 struct TargetInput(Keycode);
 
 impl Component for TargetInput {
@@ -360,7 +426,7 @@ fn main() {
         .build()
         .unwrap();
 
-    let clear_color = Color::RGB(255, 255, 255);
+    let clear_color = Color::rgb(255, 255, 255);
     let mut canvas = window.into_canvas()
         .build()
         .unwrap();
@@ -371,20 +437,27 @@ fn main() {
     let mut event_pump = sdl.event_pump().unwrap();
 
     world.add_resource(IsRunning(true));
+    world.add_resource(DebugFlag(false));
     world.add_resource(ClearColor(clear_color));
     world.add_resource(AudioTime(0));
+    world.add_resource(AudioContext{
+        milli_bpm: (160_000 - 150),
+        first_beat_offset: 110,
+    });
     world.add_resource(sink);
     world.add_resource(device);
     world.add_resource(InputEvents(Vec::new()));
     world.add_resource(SdlRects(Vec::new()));
 
     world.register::<Position>();
+    world.register::<Color>();
     world.register::<Rectangle>();
     world.register::<TargetTime>();
     world.register::<TargetInput>();
 
     world.create_entity()
         .with(Rectangle { width: 3000.0, height: 1.0 })
+        .with(Color::rgb(0,0,0))
         .with(Position { x: 0.0, y: 200.0 })
         .build();
     
