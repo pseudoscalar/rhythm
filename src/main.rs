@@ -25,6 +25,15 @@ use crate::render::{
 
 //mod rodio_ext;
 
+mod rhythm;
+use crate::rhythm::{
+    AudioContext,
+    BarIndex,
+    BarIndexTaggingSystem,
+    RhythmCombo,
+    TargetBarTime,
+};
+
 mod sdl;
 use crate::sdl::{
     InputEvent,
@@ -38,29 +47,6 @@ use crate::sdl::{
 struct DebugFlag(bool);
 
 #[derive(Default)]
-struct AudioContext {
-    milli_bpm: u64,
-    first_beat_offset: u64,
-    beats_per_bar: u8,
-    bar_millis: u64,
-    beat_millis: u64,
-}
-
-impl AudioContext {
-    fn new(milli_bpm: u64, first_beat_offset: u64, beats_per_bar: u8) -> AudioContext {
-        let beat_millis = 60_000_000  / milli_bpm;
-        let bar_millis = (60_000_000 * beats_per_bar as u64) / milli_bpm;
-        AudioContext {
-            milli_bpm,
-            first_beat_offset,
-            beats_per_bar,
-            bar_millis,
-            beat_millis,
-        }
-    }
-}
-
-#[derive(Default)]
 struct IsRunning(bool);
 
 #[derive(Default)]
@@ -69,37 +55,25 @@ struct AudioTime(u64);
 struct OmniSystem;
 
 impl<'a> System<'a> for OmniSystem {
-    type SystemData = (Entities<'a>,
+    type SystemData = (Read<'a, InputEvents>,
                        Write<'a, IsRunning>,
-                       Write<'a, InputEvents>,
                        Write<'a, ClearColor>,
                        Write<'a, AudioTime>,
                        Write<'a, DebugFlag>,
                        Read<'a, AudioContext>,
                        Option<Read<'a, Device>>,
-                       Option<Read<'a, Sink>>,
-                       ReadStorage<'a, TargetInput>,
-                       ReadStorage<'a, TargetBarTime>, 
-                       ReadStorage<'a, RhythmCombo>,
-                       WriteStorage<'a, BarIndex>,
-                       WriteStorage<'a, Color>);
+                       Option<Read<'a, Sink>>);
 
     fn run(&mut self, data: Self::SystemData) {
         let (
-            entities,
+            input_events,
             mut is_running,
-            mut input_events,
             mut clear_color,
             mut audio_time,
             mut debug_flag,
             audio_context,
             maybe_device,
             maybe_sink,
-            target_input_storage,
-            target_bar_time_storage,
-            rhythm_combo_storage,
-            mut bar_index_storage,
-            mut color_storage
         ) = data;
 
         if let (Some(device), Some(sink)) = (maybe_device, maybe_sink) {
@@ -118,8 +92,8 @@ impl<'a> System<'a> for OmniSystem {
         }
 
         debug_flag.0 = false;
-        for event in input_events.0.drain(..) {
-            match event {
+        for event in &input_events.0 {
+            match *event {
                 InputEvent { keycode: Some(Keycode::Escape), .. } => {
                     is_running.0 = false;
                 },
@@ -130,33 +104,6 @@ impl<'a> System<'a> for OmniSystem {
                         dbg!(audio_time.0 - timestamp as u64);
                     } else {
                         dbg!(("-", timestamp as u64 - audio_time.0));
-                    }
-                },
-                InputEvent { keycode: Some(keycode), timestamp } => {
-                    let targets_hit: Vec<_> = (&*entities, &target_input_storage, &target_bar_time_storage, &rhythm_combo_storage, !&bar_index_storage)
-                        .join()
-                        .filter(|(_, input, _, _, _)| input.0 == keycode)
-                        .filter_map(|(entity, _, target_bar_time, _, _)| {
-
-                            let nearest_bar = (audio_time.0.saturating_sub(target_bar_time.0) + audio_context.bar_millis / 2) / audio_context.bar_millis;
-                            let target_time = nearest_bar * audio_context.bar_millis + target_bar_time.0;
-                            let milli_error = if audio_time.0 > target_time {
-                                audio_time.0 - target_time
-                            } else {
-                                target_time - audio_time.0
-                            };
-
-                            dbg!((target_bar_time, nearest_bar, target_time, milli_error));
-
-                            if milli_error < 100 {
-                                Some((entity, nearest_bar, milli_error))
-                            } else {
-                                None
-                            }
-                        }).collect();
-
-                    for hit in targets_hit {
-                        bar_index_storage.insert(hit.0, BarIndex(hit.1));
                     }
                 },
                 _ => {},
@@ -177,40 +124,11 @@ impl Component for TargetTime {
 #[derive(Debug)]
 #[derive(Clone)]
 #[derive(Copy)]
-struct TargetBarTime(u64);
-
-impl Component for TargetBarTime {
-    type Storage = VecStorage<Self>;
-}
-
-#[derive(Debug)]
-#[derive(Clone)]
-#[derive(Copy)]
 struct TargetInput(Keycode);
 
 impl Component for TargetInput {
     type Storage = VecStorage<Self>;
 }
-
-#[derive(Debug)]
-#[derive(Default)]
-#[derive(Clone)]
-#[derive(Copy)]
-struct RhythmCombo;
-
-impl Component for RhythmCombo {
-    type Storage = NullStorage<Self>;
-}
-
-#[derive(Debug)]
-#[derive(Clone)]
-#[derive(Copy)]
-struct BarIndex(u64);
-
-impl Component for BarIndex {
-    type Storage = VecStorage<Self>;
-}
-
 
 fn main() {
     let mut world = World::new();
@@ -247,7 +165,7 @@ fn main() {
     world.add_resource(DebugFlag(false));
     world.add_resource(ClearColor(clear_color));
     world.add_resource(AudioTime(0));
-    world.add_resource(AudioContext::new((160_000 - 150), 110, 4));
+    world.add_resource(AudioContext::new(160_000 - 150, 110, 4));
     world.add_resource(sink);
     world.add_resource(device);
     world.add_resource(InputEvents(Vec::new()));
@@ -273,14 +191,9 @@ fn main() {
         .with(RhythmCombo)
         .build();
 
-    let target_bar_time = {
-        let audio_context = world.read_resource::<AudioContext>();
-
-        audio_context.bar_millis - (audio_context.beat_millis / 2)
-    };
-
+    let target_bar_time = world.read_resource::<AudioContext>().make_bar_time(4, 3, 2);
     world.create_entity()
-        .with(TargetBarTime(target_bar_time))
+        .with(target_bar_time)
         .with(TargetInput(Keycode::Right))
         .with(RhythmCombo)
         .build();
@@ -291,6 +204,7 @@ fn main() {
         .with_thread_local(sdl_system)
         .with(OmniSystem, "omni_system", &[])
         .with(RenderingSystem, "rendering_system", &[])
+        .with(BarIndexTaggingSystem, "bar_index_tagging_system", &[])
         .build();
 
     'main: loop {
