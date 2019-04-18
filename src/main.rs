@@ -42,6 +42,22 @@ struct AudioContext {
     milli_bpm: u64,
     first_beat_offset: u64,
     beats_per_bar: u8,
+    bar_millis: u64,
+    beat_millis: u64,
+}
+
+impl AudioContext {
+    fn new(milli_bpm: u64, first_beat_offset: u64, beats_per_bar: u8) -> AudioContext {
+        let beat_millis = 60_000_000  / milli_bpm;
+        let bar_millis = (60_000_000 * beats_per_bar as u64) / milli_bpm;
+        AudioContext {
+            milli_bpm,
+            first_beat_offset,
+            beats_per_bar,
+            bar_millis,
+            beat_millis,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -63,11 +79,28 @@ impl<'a> System<'a> for OmniSystem {
                        Option<Read<'a, Device>>,
                        Option<Read<'a, Sink>>,
                        ReadStorage<'a, TargetInput>,
-                       ReadStorage<'a, TargetBarRhythm>, 
+                       ReadStorage<'a, TargetBarTime>, 
+                       ReadStorage<'a, RhythmCombo>,
+                       WriteStorage<'a, BarIndex>,
                        WriteStorage<'a, Color>);
 
     fn run(&mut self, data: Self::SystemData) {
-        let (entities, mut is_running, mut input_events, mut clear_color, mut audio_time, mut debug_flag, audio_context, maybe_device, maybe_sink, target_input_storage, target_rhythm_storage, mut color_storage) = data;
+        let (
+            entities,
+            mut is_running,
+            mut input_events,
+            mut clear_color,
+            mut audio_time,
+            mut debug_flag,
+            audio_context,
+            maybe_device,
+            maybe_sink,
+            target_input_storage,
+            target_bar_time_storage,
+            rhythm_combo_storage,
+            mut bar_index_storage,
+            mut color_storage
+        ) = data;
 
         if let (Some(device), Some(sink)) = (maybe_device, maybe_sink) {
             let format = device.default_output_format().expect("Couldn't get default output format");
@@ -100,19 +133,31 @@ impl<'a> System<'a> for OmniSystem {
                     }
                 },
                 InputEvent { keycode: Some(keycode), timestamp } => {
-                    let targets_hit = (&*entities, &target_input_storage, &target_rhythm_storage)
+                    let targets_hit: Vec<_> = (&*entities, &target_input_storage, &target_bar_time_storage, &rhythm_combo_storage, !&bar_index_storage)
                         .join()
-                        .filter(|(_, input, _)| input.0 == keycode)
-                        .filter_map(|(entity, _, target_rhythm)| {
-                            let target_bar_time = target_rhythm.0 as u64 * 60_000_000 / ((1<<(MAX_BEAT_DIVISION-1)) * audio_context.milli_bpm);
-                            let milli_error = 0;
+                        .filter(|(_, input, _, _, _)| input.0 == keycode)
+                        .filter_map(|(entity, _, target_bar_time, _, _)| {
 
-                            dbg!(target_bar_time);
+                            let nearest_bar = (audio_time.0.saturating_sub(target_bar_time.0) + audio_context.bar_millis / 2) / audio_context.bar_millis;
+                            let target_time = nearest_bar * audio_context.bar_millis + target_bar_time.0;
+                            let milli_error = if audio_time.0 > target_time {
+                                audio_time.0 - target_time
+                            } else {
+                                target_time - audio_time.0
+                            };
 
-                            Some((entity, milli_error))
-                        });
+                            dbg!((target_bar_time, nearest_bar, target_time, milli_error));
 
-                    for _ in targets_hit {}
+                            if milli_error < 100 {
+                                Some((entity, nearest_bar, milli_error))
+                            } else {
+                                None
+                            }
+                        }).collect();
+
+                    for hit in targets_hit {
+                        bar_index_storage.insert(hit.0, BarIndex(hit.1));
+                    }
                 },
                 _ => {},
             }
@@ -132,10 +177,9 @@ impl Component for TargetTime {
 #[derive(Debug)]
 #[derive(Clone)]
 #[derive(Copy)]
-struct TargetBarRhythm(u16);
-const MAX_BEAT_DIVISION: u8 = 4;
+struct TargetBarTime(u64);
 
-impl Component for TargetBarRhythm {
+impl Component for TargetBarTime {
     type Storage = VecStorage<Self>;
 }
 
@@ -147,6 +191,26 @@ struct TargetInput(Keycode);
 impl Component for TargetInput {
     type Storage = VecStorage<Self>;
 }
+
+#[derive(Debug)]
+#[derive(Default)]
+#[derive(Clone)]
+#[derive(Copy)]
+struct RhythmCombo;
+
+impl Component for RhythmCombo {
+    type Storage = NullStorage<Self>;
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
+#[derive(Copy)]
+struct BarIndex(u64);
+
+impl Component for BarIndex {
+    type Storage = VecStorage<Self>;
+}
+
 
 fn main() {
     let mut world = World::new();
@@ -183,11 +247,7 @@ fn main() {
     world.add_resource(DebugFlag(false));
     world.add_resource(ClearColor(clear_color));
     world.add_resource(AudioTime(0));
-    world.add_resource(AudioContext{
-        milli_bpm: (160_000 - 150),
-        first_beat_offset: 110,
-        beats_per_bar: 4,
-    });
+    world.add_resource(AudioContext::new((160_000 - 150), 110, 4));
     world.add_resource(sink);
     world.add_resource(device);
     world.add_resource(InputEvents(Vec::new()));
@@ -196,8 +256,10 @@ fn main() {
     world.register::<Position>();
     world.register::<Color>();
     world.register::<Rectangle>();
-    world.register::<TargetBarRhythm>();
+    world.register::<TargetBarTime>();
     world.register::<TargetInput>();
+    world.register::<RhythmCombo>();
+    world.register::<BarIndex>();
 
     world.create_entity()
         .with(Rectangle { width: 3000.0, height: 1.0 })
@@ -206,13 +268,21 @@ fn main() {
         .build();
 
     world.create_entity()
-        .with(TargetBarRhythm(0))
+        .with(TargetBarTime(0))
         .with(TargetInput(Keycode::Left))
+        .with(RhythmCombo)
         .build();
 
+    let target_bar_time = {
+        let audio_context = world.read_resource::<AudioContext>();
+
+        audio_context.bar_millis - (audio_context.beat_millis / 2)
+    };
+
     world.create_entity()
-        .with(TargetBarRhythm(3*(1<<(MAX_BEAT_DIVISION-1))))
+        .with(TargetBarTime(target_bar_time))
         .with(TargetInput(Keycode::Right))
+        .with(RhythmCombo)
         .build();
 
     let sdl_system = SdlSystem::new(sdl, canvas, event_pump);
